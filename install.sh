@@ -13,6 +13,10 @@ say() { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31mERRO:\033[0m %s\n' "$*" >&2; exit 1; }
 
 # ---- deps sanity (build) ----
+# respect user rustup install (~/.cargo/bin) if not on PATH yet
+if ! command -v cargo >/dev/null && [ -x "$HOME/.cargo/bin/cargo" ]; then
+  export PATH="$HOME/.cargo/bin:$PATH"
+fi
 command -v cargo >/dev/null || die "cargo não encontrado. Instale Rust: https://rustup.rs"
 command -v pkg-config >/dev/null || die "pkg-config não encontrado (sudo apt-get install pkg-config)"
 [ -f /usr/include/openssl/ssl.h ] || [ -f /usr/include/x86_64-linux-gnu/openssl/ssl.h ] \

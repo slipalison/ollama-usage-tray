@@ -520,6 +520,7 @@ version = "1.0.0"
 dependencies = [
  "fd-lock",
  "ksni",
+ "libc",
  "native-tls",
  "serde",
  "serde_json",

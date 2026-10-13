@@ -81,4 +81,4 @@ else
   pgrep -f "$BIN_DST" >/dev/null || say "AVISO: o tray não subiu — rode '$BIN_DST' manualmente para ver o erro"
 fi
 
-say "Pronto! Ícone na bandeja: \$usado/\$créditos do plano Ollama."
+say "Pronto! Ícone na bandeja com o uso do plano Ollama."

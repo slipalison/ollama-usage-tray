@@ -7,126 +7,132 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 
-const POLL_SECS: u64 = 300; // 5 min
-const RESET_DAY: u32 = 26; // plan started on the 26th (account CreatedAt 2026-05-26)
+const POLL_SECS: u64 = 300; // 5 min (the API allows 10 req/min per endpoint)
+const API: &str = "https://ollama.com/api";
 
 // ---------------------------------------------------------------- usage model
 
 #[derive(Debug, Clone)]
 struct Usage {
-    ok: bool,
     err: Option<String>,
     plan: String,
-    plan_total: f64,
-    weekly_frac: f64,
-    session_frac: f64,
-    requests: Vec<(String, u64)>,
+    // limits or credits (GET /api/balance); None until a fetch succeeds
+    balance: Option<BalanceResp>,
+    // last 7 days (GET /api/usage?range=7d)
+    week: Option<UsageTotals>,
+    // failures of the optional endpoints (api/me, api/usage): the balance still shows
+    warnings: Vec<String>,
+    // Retry-After (s) of a 429 from an optional endpoint
+    retry_after: Option<u64>,
     masked_key: String,
-    // new pricing model: monthly usage in dollars (old model uses session/weekly fractions)
-    monthly_cost: Option<f64>,
-    has_session_weekly: bool,
-    monthly_period: Option<String>,
 }
 
 impl Default for Usage {
     fn default() -> Self {
         Self {
-            ok: false,
             err: Some("carregando...".into()),
             plan: "?".into(),
-            plan_total: 0.0,
-            weekly_frac: 0.0,
-            session_frac: 0.0,
-            requests: vec![],
+            balance: None,
+            week: None,
+            warnings: vec![],
+            retry_after: None,
             masked_key: "—".into(),
-            monthly_cost: None,
-            has_session_weekly: false,
-            monthly_period: None,
         }
     }
 }
 
 impl Usage {
-    fn weekly_used(&self) -> f64 {
-        self.weekly_frac * self.plan_total
-    }
-    fn weekly_left(&self) -> f64 {
-        (self.plan_total - self.weekly_used()).max(0.0)
-    }
-    // dollar amount actually used this cycle (new monthly model: activity.cost; old model: weekly_frac * plan_total)
-    fn used_amount(&self) -> f64 {
-        self.monthly_cost.unwrap_or_else(|| self.weekly_used())
-    }
-    fn remaining(&self) -> f64 {
-        (self.plan_total - self.used_amount()).max(0.0)
-    }
-    // fraction of the monthly plan already consumed (drives title + icon color)
-    fn plan_frac(&self) -> f64 {
-        if self.plan_total <= 0.0 {
-            0.0
-        } else {
-            (self.used_amount() / self.plan_total).clamp(0.0, 1.0)
-        }
-    }
-    // true if the account still uses the old session/weekly limits
-    fn legacy_limits(&self) -> bool {
-        self.has_session_weekly && self.monthly_cost.is_none()
+    // an optional endpoint failed: keep going, but say so
+    fn note(&mut self, e: ApiError) {
+        self.retry_after = self.retry_after.max(e.retry_after);
+        self.warnings.push(e.msg);
     }
 }
 
 // ---------------------------------------------------------------- API types
 
+// GET /api/balance
+#[derive(Deserialize, Debug, Clone)]
+struct BalanceResp {
+    included: Included,
+    #[serde(default)]
+    purchased: Purchased,
+}
+
+// one shape per pricing model
+#[derive(Deserialize, Debug, Clone)]
+#[serde(untagged)]
+enum Included {
+    // legacy plans: session/weekly limits, no dollar amounts
+    Legacy { session: Limit, weekly: Limit },
+    // monthly credits in dollars
+    Credits {
+        balance_usd: f64,
+        allowance_usd: f64,
+        period: Period,
+    },
+}
+
+impl Included {
+    // fraction already consumed (drives icon color): the tightest limit
+    fn used_frac(&self) -> f64 {
+        match self {
+            Included::Legacy { session, weekly } => session.used_frac().max(weekly.used_frac()),
+            Included::Credits {
+                balance_usd,
+                allowance_usd,
+                ..
+            } => {
+                if *allowance_usd <= 0.0 {
+                    0.0
+                } else {
+                    (credits_used(*balance_usd, *allowance_usd) / allowance_usd).clamp(0.0, 1.0)
+                }
+            }
+        }
+    }
+}
+
+fn credits_used(balance_usd: f64, allowance_usd: f64) -> f64 {
+    (allowance_usd - balance_usd).max(0.0)
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct Limit {
+    remaining_percent: f64,
+    resets_at: String,
+}
+
+impl Limit {
+    fn used_frac(&self) -> f64 {
+        (1.0 - self.remaining_percent / 100.0).clamp(0.0, 1.0)
+    }
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct Period {
+    from: String,
+    until: String,
+}
+
+#[derive(Deserialize, Debug, Clone, Default)]
+struct Purchased {
+    #[serde(default)]
+    balance_usd: f64,
+}
+
+// GET /api/usage: a time series; only the totals are shown
 #[derive(Deserialize)]
 struct UsageResp {
-    limits: Option<Limits>,
-    #[serde(default)]
-    activity: Option<Activity>,
+    totals: UsageTotals,
 }
 
-#[derive(Deserialize)]
-struct Activity {
-    #[serde(default)]
-    cost: Option<String>,
-    #[serde(default)]
-    period: Option<Period>,
-}
-
-#[derive(Deserialize)]
-struct Period {
-    #[serde(default, rename = "type")]
-    typ: Option<String>,
-    #[serde(default, rename = "starting_at")]
-    #[allow(dead_code)]
-    starting_at: Option<String>,
-    #[serde(default, rename = "ending_at")]
-    #[allow(dead_code)]
-    ending_at: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct Limits {
-    session: Option<Session>,
-    weekly: Option<Weekly>,
-}
-
-#[derive(Deserialize)]
-struct Session {
-    usage: Option<f64>,
-    #[serde(default)]
-    models: Option<Vec<ModelCount>>,
-}
-
-#[derive(Deserialize)]
-struct Weekly {
-    usage: Option<f64>,
-    #[serde(default)]
-    models: Option<Vec<ModelCount>>,
-}
-
-#[derive(Deserialize, Clone)]
-struct ModelCount {
-    name: String,
+#[derive(Deserialize, Debug, Clone)]
+struct UsageTotals {
     request_count: u64,
+    // omitted for legacy plans
+    #[serde(default)]
+    usage_usd: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -165,7 +171,8 @@ fn ensure_icons_installed_impl() {
         None => return,
     };
     let target = std::path::Path::new(&home).join(".local/share/icons/hicolor/22x22/apps");
-    let dst = target.join("ollama-usage-tray.png");
+    // the red variant is the last one save_icons.py writes
+    let dst = target.join("ollama-usage-tray-crit.png");
     if dst.is_file() {
         // refresh theme cache even if icons already exist (helps after a first install)
         let _ = std::process::Command::new("update-icon-caches")
@@ -209,19 +216,24 @@ impl ksni::Tray for OllamaTray {
 
     fn title(&self) -> String {
         let u = self.usage.lock().unwrap();
-        if u.ok {
-            format!("${:.0}/${:.0}", u.used_amount(), u.plan_total)
-        } else {
-            "…".into()
+        match &u.balance {
+            Some(b) => title_text(&b.included),
+            None => "…".into(),
         }
     }
 
     fn icon_name(&self) -> String {
         let u = self.usage.lock().unwrap();
-        if !u.ok {
+        let Some(b) = &u.balance else {
             return "network-offline".into();
+        };
+        let name = icon_variant(b.included.used_frac());
+        // installs older than the colored variants only have the blue icon
+        if icons_dir().join(format!("{name}.png")).is_file() {
+            name.into()
+        } else {
+            "ollama-usage-tray".into()
         }
-        "ollama-usage-tray".into()
     }
 
     fn icon_theme_path(&self) -> String {
@@ -236,7 +248,7 @@ impl ksni::Tray for OllamaTray {
         let u = self.usage.lock().unwrap();
         let mut tt = ksni::ToolTip::default();
         tt.title = "Ollama Cloud".into();
-        if !u.ok {
+        if u.balance.is_none() {
             tt.description = format!(
                 "Sem dados{}\nAguardando o próximo ciclo de atualização.",
                 u.err
@@ -246,24 +258,21 @@ impl ksni::Tray for OllamaTray {
             );
             return tt;
         }
-        tt.description = format_tooltip(&u);
+        tt.description = format_tooltip(&u, unix_now());
         tt
     }
 
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         use ksni::menu::*;
-        let u = self.usage.lock().unwrap();
-        let reqs: String = if u.requests.is_empty() {
-            "-".into()
-        } else {
-            u.requests
-                .iter()
-                .map(|(n, c)| format!("{n}: {c}"))
-                .collect::<Vec<_>>()
-                .join(", ")
+        let info: Vec<String> = {
+            let u = self.usage.lock().unwrap();
+            if u.balance.is_none() {
+                vec![format!("Sem dados ({})", u.err.as_deref().unwrap_or("…"))]
+            } else {
+                detail_lines(&u, unix_now())
+            }
         };
-        drop(u);
-        vec![
+        let mut items: Vec<MenuItem<Self>> = vec![
             StandardItem {
                 label: "Atualizar agora".into(),
                 icon_name: "view-refresh".into(),
@@ -274,87 +283,16 @@ impl ksni::Tray for OllamaTray {
             }
             .into(),
             MenuItem::Separator,
+        ];
+        items.extend(info.into_iter().map(|label| {
             StandardItem {
-                label: {
-                    let u = self.usage.lock().unwrap();
-                    format!("Plano: {}", u.plan)
-                },
+                label,
                 enabled: false,
                 ..Default::default()
             }
-            .into(),
-            StandardItem {
-                label: {
-                    let u = self.usage.lock().unwrap();
-                    format!("Créditos do plano: ${:.0}/mês", u.plan_total)
-                },
-                enabled: false,
-                ..Default::default()
-            }
-            .into(),
-            StandardItem {
-                label: {
-                    let u = self.usage.lock().unwrap();
-                    if !u.ok {
-                        "Usado: …".into()
-                    } else if u.legacy_limits() {
-                        format!(
-                            "Usado (7 dias): ${:.2} de ${:.0} ({:.0}%)",
-                            u.weekly_used(),
-                            u.plan_total,
-                            u.weekly_frac * 100.0
-                        )
-                    } else {
-                        format!(
-                            "Usado (mês): ${:.2} de ${:.0} ({:.0}%)",
-                            u.used_amount(),
-                            u.plan_total,
-                            u.plan_frac() * 100.0
-                        )
-                    }
-                },
-                enabled: false,
-                ..Default::default()
-            }
-            .into(),
-            StandardItem {
-                label: {
-                    let u = self.usage.lock().unwrap();
-                    if !u.ok {
-                        "Sessão atual: …".into()
-                    } else if u.legacy_limits() {
-                        format!("Sessão atual: {:.1}%", u.session_frac * 100.0)
-                    } else {
-                        let period = u
-                            .monthly_period
-                            .as_deref()
-                            .map(|p| {
-                                // "last_4_weeks" -> "últimas 4 semanas"
-                                p.replace("last_4_weeks", "últimas 4 semanas")
-                                    .replace("current_month", "mês atual")
-                            });
-                        format!(
-                            "Sessão atual: —  (período: {})",
-                            period.unwrap_or("mensal".into())
-                        )
-                    }
-                },
-                enabled: false,
-                ..Default::default()
-            }
-            .into(),
-            StandardItem {
-                label: format!("Requests (semana): {reqs}"),
-                enabled: false,
-                ..Default::default()
-            }
-            .into(),
-            StandardItem {
-                label: format!("Renova em: {}", reset_label()),
-                enabled: false,
-                ..Default::default()
-            }
-            .into(),
+            .into()
+        }));
+        items.extend(vec![
             MenuItem::Separator,
             StandardItem {
                 label: "Abrir ollama.com/settings".into(),
@@ -451,87 +389,147 @@ impl ksni::Tray for OllamaTray {
                 ..Default::default()
             }
             .into(),
-        ]
+        ]);
+        items
     }
 }
 
-fn format_tooltip(u: &Usage) -> String {
-    let mut s = String::new();
-    if u.legacy_limits() {
-        // modelo antigo: limites de sessão/semana
-        s.push_str(&format!("Plano: {}\n", u.plan));
-        s.push_str(&format!("Créditos: ${:.0}/mês\n", u.plan_total));
-        s.push_str(&format!(
-            "Usado (7 dias): ${:.2} ({:.1}% dos créditos)\n",
-            u.weekly_used(),
-            u.weekly_frac * 100.0
-        ));
-        s.push_str(&format!("Sessão atual: {:.1}%\n", u.session_frac * 100.0));
-        s.push_str(&format!("Disponível: ${:.2}\n", u.weekly_left()));
+// "S43% · W10%" (legacy session/weekly limits) or "$28/$100" (monthly credits)
+fn title_text(inc: &Included) -> String {
+    match inc {
+        Included::Legacy { session, weekly } => format!(
+            "S{:.0}% · W{:.0}%",
+            session.used_frac() * 100.0,
+            weekly.used_frac() * 100.0
+        ),
+        Included::Credits {
+            balance_usd,
+            allowance_usd,
+            ..
+        } => format!(
+            "${:.0}/${:.0}",
+            credits_used(*balance_usd, *allowance_usd),
+            allowance_usd
+        ),
+    }
+}
+
+// ring color of the icon: blue, orange >= 70%, red >= 90% (rendered by save_icons.py)
+fn icon_variant(frac: f64) -> &'static str {
+    if frac >= 0.9 {
+        "ollama-usage-tray-crit"
+    } else if frac >= 0.7 {
+        "ollama-usage-tray-warn"
     } else {
-        // modelo novo: créditos mensais em $
-        s.push_str(&format!("Plano: {}\n", u.plan));
-        s.push_str(&format!("Créditos: ${:.0}/mês\n", u.plan_total));
-        s.push_str(&format!(
-            "Usado (mês): ${:.2} ({:.1}%)\n",
-            u.used_amount(),
-            u.plan_frac() * 100.0
+        "ollama-usage-tray"
+    }
+}
+
+// one line per fact, shared by the menu, the tooltip and `key-info`
+fn detail_lines(u: &Usage, now: i64) -> Vec<String> {
+    let mut lines = vec![format!("Plano: {}", u.plan)];
+    if let Some(b) = &u.balance {
+        match &b.included {
+            Included::Legacy { session, weekly } => {
+                lines.push(limit_line("Sessão", session, now));
+                lines.push(limit_line("Semana", weekly, now));
+            }
+            Included::Credits {
+                balance_usd,
+                allowance_usd,
+                period,
+            } => {
+                lines.push(format!(
+                    "Créditos do plano: ${:.2} de ${:.2} usados ({:.1}%) · ${:.2} disponível",
+                    credits_used(*balance_usd, *allowance_usd),
+                    allowance_usd,
+                    b.included.used_frac() * 100.0,
+                    balance_usd
+                ));
+                lines.push(format!(
+                    "Período: {} a {} · {}",
+                    date_label(&period.from),
+                    date_label(&period.until),
+                    reset_label(&period.until, now)
+                ));
+            }
+        }
+        lines.push(format!(
+            "Créditos comprados: ${:.2}",
+            b.purchased.balance_usd
         ));
-        s.push_str(&format!("Disponível: ${:.2}\n", u.remaining()));
     }
-    s.push_str(&format!("Renova: {}", reset_label()));
-    s.push_str(&format!("\nAPI key: {}", u.masked_key));
-    if !u.requests.is_empty() {
-        let reqs: Vec<String> = u
-            .requests
-            .iter()
-            .map(|(n, c)| format!("{n}: {c}"))
-            .collect();
-        s.push_str(&format!("\nRequests: {}", reqs.join(", ")));
+    if let Some(w) = &u.week {
+        lines.push(match w.usage_usd {
+            Some(usd) => format!("Requests (7 dias): {} · ${usd:.2}", w.request_count),
+            None => format!("Requests (7 dias): {}", w.request_count),
+        });
     }
-    s
+    lines
+}
+
+fn limit_line(name: &str, l: &Limit, now: i64) -> String {
+    format!(
+        "{name}: {:.1}% usado · {}",
+        l.used_frac() * 100.0,
+        reset_label(&l.resets_at, now)
+    )
+}
+
+fn format_tooltip(u: &Usage, now: i64) -> String {
+    let mut lines = detail_lines(u, now);
+    lines.push(format!("API key: {}", u.masked_key));
+    lines.extend(u.warnings.iter().map(|w| format!("Aviso: {w}")));
+    lines.join("\n")
 }
 
 // ---------------------------------------------------------------- reset date
 
-fn reset_label() -> String {
-    let days = days_until_reset();
-    let date = next_reset_date_str();
-    match days {
-        0 => "hoje".into(),
-        1 => format!("amanhã ({date})"),
-        n => format!("{n} dias ({date})"),
-    }
-}
-
-fn days_until_reset() -> u64 {
-    let now = unix_now();
-    let (_, _, d) = epoch_to_ymd(now);
-    if (d as i64) < RESET_DAY as i64 {
-        (RESET_DAY as i64 - d as i64) as u64
-    } else if d == RESET_DAY {
-        0
-    } else {
-        days_in_current_month_left(now)
-    }
-}
-
-fn days_in_current_month_left(now: i64) -> u64 {
-    let (y, m, d) = epoch_to_ymd(now);
-    let dim = days_in_month(y, m);
-    (dim as i64 - d as i64 + RESET_DAY as i64) as u64
-}
-
-fn next_reset_date_str() -> String {
-    let now = unix_now();
-    let (y, m, d) = epoch_to_ymd(now);
-    let nm = if d >= RESET_DAY {
-        if m == 12 { 1 } else { m + 1 }
-    } else {
-        m
+// "renova em 1h21 (16:00)", "renova em 5d 6h (19/10 21:00)" — local time
+fn reset_label(ts: &str, now: i64) -> String {
+    let Some(at) = parse_rfc3339(ts) else {
+        return format!("renova em {ts}");
     };
-    let _ = y;
-    format!("{RESET_DAY:02}/{nm:02}")
+    let t = local_time(at);
+    let hm = format!("{:02}:{:02}", t.hour, t.minute);
+    let secs = at - now;
+    if secs <= 0 {
+        format!("renovou ({hm})")
+    } else if secs < 86_400 {
+        format!("renova em {} ({hm})", until_label(secs))
+    } else {
+        format!(
+            "renova em {} ({:02}/{:02} {hm})",
+            until_label(secs),
+            t.day,
+            t.month
+        )
+    }
+}
+
+// "15/10", local time
+fn date_label(ts: &str) -> String {
+    match parse_rfc3339(ts) {
+        Some(at) => {
+            let t = local_time(at);
+            format!("{:02}/{:02}", t.day, t.month)
+        }
+        None => ts.to_string(),
+    }
+}
+
+// time left until a reset: "21 min", "1h21", "5d 6h"
+fn until_label(secs: i64) -> String {
+    // round up, so that a pending reset never reads as "0 min"
+    let mins = (secs + 59) / 60;
+    if mins < 60 {
+        format!("{mins} min")
+    } else if mins < 24 * 60 {
+        format!("{}h{:02}", mins / 60, mins % 60)
+    } else {
+        let hours = mins / 60;
+        format!("{}d {}h", hours / 24, hours % 24)
+    }
 }
 
 fn unix_now() -> i64 {
@@ -541,20 +539,62 @@ fn unix_now() -> i64 {
         .as_secs() as i64
 }
 
-// days in month (m: 1-12)
-fn days_in_month(y: i64, m: u32) -> u32 {
-    match m {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 => {
-            if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
-                29
-            } else {
-                28
-            }
-        }
-        _ => 30,
+// "2026-10-13T19:00:00Z" (also fractional seconds and "+hh:mm" offsets) -> unix seconds
+fn parse_rfc3339(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    if b.len() < 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || !matches!(b[10], b'T' | b't' | b' ')
+        || b[13] != b':'
+        || b[16] != b':'
+    {
+        return None;
     }
+    let num = |from: usize, to: usize| -> Option<i64> {
+        let part = s.get(from..to)?;
+        if !part.bytes().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        part.parse().ok()
+    };
+    let (y, mo, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
+    let (h, mi, se) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || se > 60 {
+        return None;
+    }
+    let mut rest = s.get(19..)?;
+    if let Some(frac) = rest.strip_prefix('.') {
+        let digits = frac.bytes().take_while(u8::is_ascii_digit).count();
+        rest = &frac[digits..];
+    }
+    let offset = match rest {
+        "Z" | "z" => 0,
+        _ => {
+            let sign = match rest.as_bytes().first()? {
+                b'+' => 1,
+                b'-' => -1,
+                _ => return None,
+            };
+            let (oh, om) = rest[1..].split_once(':')?;
+            if oh.len() != 2 || om.len() != 2 {
+                return None;
+            }
+            sign * (oh.parse::<i64>().ok()? * 3600 + om.parse::<i64>().ok()? * 60)
+        }
+    };
+    Some(days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + se - offset)
+}
+
+// epoch days from a civil date (Howard Hinnant's algorithm)
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12; // March = 0
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 // civil date from epoch days (Howard Hinnant's algorithm)
@@ -572,14 +612,34 @@ fn epoch_to_ymd(secs: i64) -> (i64, u32, u32) {
     (y, m, d)
 }
 
-// ---------------------------------------------------------------- plan totals
+struct LocalTime {
+    day: u32,
+    month: u32,
+    hour: u32,
+    minute: u32,
+}
 
-fn plan_total_for(plan: &str) -> f64 {
-    match plan.to_ascii_lowercase().as_str() {
-        "max" => 300.0,
-        "pro" => 60.0,
-        "team" => 1000.0,
-        _ => 300.0,
+// the API speaks UTC; show resets in the user's timezone
+fn local_time(secs: i64) -> LocalTime {
+    let t = secs as libc::time_t;
+    // SAFETY: tm is plain old data; localtime_r only writes into the struct we own
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+        // no timezone info: fall back to UTC
+        let (_, month, day) = epoch_to_ymd(secs);
+        let s = secs.rem_euclid(86_400);
+        return LocalTime {
+            day,
+            month,
+            hour: (s / 3600) as u32,
+            minute: (s % 3600 / 60) as u32,
+        };
+    }
+    LocalTime {
+        day: tm.tm_mday as u32,
+        month: tm.tm_mon as u32 + 1,
+        hour: tm.tm_hour as u32,
+        minute: tm.tm_min as u32,
     }
 }
 
@@ -629,84 +689,119 @@ fn read_api_key() -> Result<(String, String), String> {
     Ok((key, format!("opencode {}", path.display())))
 }
 
-fn fetch_usage(key: &str, _key_source: &str) -> Result<Usage, String> {
+#[derive(Debug)]
+struct ApiError {
+    msg: String,
+    // seconds from the Retry-After header of a 429
+    retry_after: Option<u64>,
+}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.msg)
+    }
+}
+
+// decodes a JSON response; failures carry the API's own `error` message
+fn read_json<T: serde::de::DeserializeOwned>(
+    endpoint: &str,
+    res: Result<ureq::Response, ureq::Error>,
+) -> Result<T, ApiError> {
+    let resp = res.map_err(|e| api_error(endpoint, e))?;
+    resp.into_json().map_err(|e| ApiError {
+        msg: format!("{endpoint}: resposta inesperada: {e}"),
+        retry_after: None,
+    })
+}
+
+fn api_error(endpoint: &str, e: ureq::Error) -> ApiError {
+    match e {
+        ureq::Error::Status(code, resp) => {
+            let retry_after = if code == 429 {
+                resp.header("Retry-After")
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+            } else {
+                None
+            };
+            let status = resp.status_text().to_string();
+            let detail = resp
+                .into_string()
+                .ok()
+                .and_then(|body| error_field(&body))
+                .unwrap_or(status);
+            let mut msg = format!("{endpoint}: HTTP {code}: {detail}");
+            if let Some(s) = retry_after {
+                msg.push_str(&format!(" (nova tentativa em {s} s)"));
+            }
+            ApiError { msg, retry_after }
+        }
+        ureq::Error::Transport(t) => ApiError {
+            msg: format!("{endpoint}: {t}"),
+            retry_after: None,
+        },
+    }
+}
+
+// Ollama's JSON error format: {"error": "..."}
+fn error_field(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    v.get("error")?.as_str().map(str::to_string)
+}
+
+fn fetch_usage(key: &str, _key_source: &str) -> Result<Usage, ApiError> {
     // native-tls: usa o keystore do sistema (obrigatório em rede com CA corporativa, ex.: Netskope)
-    let tls = native_tls::TlsConnector::new()
-        .map_err(|e| format!("tls: {e}"))?;
+    let tls = native_tls::TlsConnector::new().map_err(|e| ApiError {
+        msg: format!("tls: {e}"),
+        retry_after: None,
+    })?;
     let agent = ureq::AgentBuilder::new()
         .tls_connector(std::sync::Arc::new(tls))
         .timeout(Duration::from_secs(15))
         .build();
+    let auth = format!("Bearer {key}");
+
+    // limits or credits (GET /api/balance): the essential data — without it there is nothing to show
+    let balance: BalanceResp = read_json(
+        "api/balance",
+        agent
+            .get(&format!("{API}/balance"))
+            .set("Authorization", &auth)
+            .call(),
+    )?;
+    let mut usage = Usage {
+        err: None,
+        balance: Some(balance),
+        masked_key: mask_key(key),
+        ..Default::default()
+    };
 
     // plan name (POST /api/me)
-    let me: MeResp = agent
-        .post("https://ollama.com/api/me")
-        .set("Authorization", &format!("Bearer {key}"))
-        .set("Content-Type", "application/json")
-        .send_string("{}")
-        .map_err(|e| format!("api/me: {e}"))?
-        .into_json()
-        .map_err(|e| format!("parse me: {e}"))?;
-    let plan = me.plan.unwrap_or_else(|| "max".into());
-    let plan_total = plan_total_for(&plan);
+    match read_json::<MeResp>(
+        "api/me",
+        agent
+            .post(&format!("{API}/me"))
+            .set("Authorization", &auth)
+            .set("Content-Type", "application/json")
+            .send_string("{}"),
+    ) {
+        Ok(me) => usage.plan = me.plan.unwrap_or_else(|| "?".into()),
+        Err(e) => usage.note(e),
+    }
 
-    // usage fractions (GET /api/usage)
-    let resp = agent
-        .get("https://ollama.com/api/usage")
-        .set("Authorization", &format!("Bearer {key}"))
-        .call()
-        .map_err(|e| format!("api/usage: {e}"))?;
-    let body: UsageResp = resp
-        .into_json()
-        .map_err(|e| format!("parse usage: {e}"))?;
-    let limits = body
-        .limits
-        .ok_or("resposta sem limits")?;
-    let weekly_frac = limits.weekly.as_ref().and_then(|w| w.usage).unwrap_or(0.0);
-    let session_frac = limits.session.as_ref().and_then(|s| s.usage).unwrap_or(0.0);
-    let has_session_weekly = limits.session.is_some() || limits.weekly.is_some();
-    // requests: novo modelo pode usar limits.session; antigo usa weekly
-    let requests_models = if let Some(w) = &limits.weekly {
-        w.models.clone()
-    } else {
-        limits.session.as_ref().and_then(|s| s.models.clone())
-    };
-    let requests: Vec<(String, u64)> = requests_models
-        .unwrap_or_default()
-        .into_iter()
-        .map(|m| (m.name, m.request_count))
-        .collect();
+    // request totals of the last 7 days (GET /api/usage); per-model counts are no longer available
+    match read_json::<UsageResp>(
+        "api/usage",
+        agent
+            .get(&format!("{API}/usage"))
+            .query("range", "7d")
+            .set("Authorization", &auth)
+            .call(),
+    ) {
+        Ok(r) => usage.week = Some(r.totals),
+        Err(e) => usage.note(e),
+    }
 
-    // ---- pricing model detection ----
-    // antigo: limits.session/weekly presentes (frações do plano) + activity.cost == 0
-    // novo: créditos mensais em $ -> session/weekly ausentes, activity.cost = $ usados no mês
-    let monthly_cost: Option<f64> = if has_session_weekly {
-        None
-    } else {
-        body.activity
-            .as_ref()
-            .and_then(|a| a.cost.as_ref())
-            .and_then(|c| c.parse::<f64>().ok())
-    };
-    let monthly_period: Option<String> = body
-        .activity
-        .as_ref()
-        .and_then(|a| a.period.as_ref())
-        .and_then(|p| p.typ.clone());
-
-    Ok(Usage {
-        ok: true,
-        err: None,
-        plan,
-        plan_total,
-        weekly_frac,
-        session_frac,
-        requests,
-        masked_key: mask_key(key),
-        monthly_cost,
-        has_session_weekly,
-        monthly_period,
-    })
+    Ok(usage)
 }
 
 // ---------------------------------------------------------------- main
@@ -808,10 +903,12 @@ fn run_cli(args: &[String]) -> i32 {
                 println!("origem: {src}");
                 match fetch_usage(&k, &src) {
                     Ok(u) => {
-                        println!("plano: {} (${:.0}/mês)", u.plan, u.plan_total);
-                        println!("usado (7 dias): ${:.2} ({:.1}%)", u.weekly_used(), u.weekly_frac * 100.0);
-                        println!("sessão: {:.1}%", u.session_frac * 100.0);
-                        println!("renova: {}", reset_label());
+                        for line in detail_lines(&u, unix_now()) {
+                            println!("{line}");
+                        }
+                        for w in &u.warnings {
+                            eprintln!("aviso: {w}");
+                        }
                         0
                     }
                     Err(e) => {
@@ -925,26 +1022,283 @@ fn poller(
 ) {
     let interval = Duration::from_secs(POLL_SECS);
     let mut next_fetch = Instant::now(); // fetch immediately
+    // after a 429 nothing is sent before this, not even "Atualizar agora"
+    let mut not_before = Instant::now();
     loop {
         if quit.load(Ordering::SeqCst) {
             return;
         }
         if Instant::now() >= next_fetch {
             let fresh = fetch_usage(&key, &key_source);
+            let now = Instant::now();
+            next_fetch = now + interval;
+            let retry_after = match &fresh {
+                Ok(nu) => nu.retry_after,
+                Err(e) => e.retry_after,
+            };
+            if let Some(s) = retry_after {
+                not_before = now + Duration::from_secs(s.max(5));
+                if fresh.is_err() {
+                    // no data to show: retry as soon as the API allows
+                    next_fetch = not_before;
+                }
+            }
             let mut u = usage.lock().unwrap();
             match fresh {
                 Ok(nu) => *u = nu,
                 Err(e) => {
-                    u.ok = false;
-                    u.err = Some(e);
+                    u.balance = None;
+                    u.err = Some(e.msg);
                 }
             }
-            next_fetch = Instant::now() + interval;
         }
         match rx.recv_timeout(Duration::from_secs(1)) {
-            Ok(_) => next_fetch = Instant::now(), // manual refresh
+            Ok(_) => next_fetch = Instant::now().max(not_before), // manual refresh
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // GET /api/balance, legacy plan (observed response)
+    const BALANCE_LEGACY: &str = r#"{
+      "included": {
+        "session": { "remaining_percent": 57.32, "resets_at": "2026-10-13T19:00:00Z" },
+        "weekly":  { "remaining_percent": 90.08, "resets_at": "2026-10-19T00:00:00Z" }
+      },
+      "purchased": { "balance_usd": 0 }
+    }"#;
+
+    // GET /api/balance, monthly credits (docs.ollama.com/api/balance)
+    const BALANCE_CREDITS: &str = r#"{
+      "included": {
+        "balance_usd": 72.5,
+        "allowance_usd": 100,
+        "period": { "from": "2026-09-15T09:30:00Z", "until": "2026-10-15T09:30:00Z" }
+      },
+      "purchased": { "balance_usd": 25 }
+    }"#;
+
+    // GET /api/usage?range=7d, legacy plan: no usage_usd nor tokens
+    const USAGE_LEGACY: &str = r#"{
+      "range": "7d", "scope": "self", "granularity": "day",
+      "from": "2026-10-06T00:00:00Z", "until": "2026-10-13T17:38:36Z",
+      "totals": { "request_count": 2922 },
+      "buckets": [
+        { "from": "2026-10-06T00:00:00Z", "until": "2026-10-07T00:00:00Z", "request_count": 578 },
+        { "from": "2026-10-13T00:00:00Z", "until": "2026-10-13T17:38:36Z", "partial": true, "request_count": 388 }
+      ]
+    }"#;
+
+    // GET /api/usage?range=24h, new plan (docs.ollama.com/api/cloud-usage)
+    const USAGE_CREDITS: &str = r#"{
+      "range": "24h", "scope": "self", "granularity": "hour",
+      "from": "2026-09-30T02:00:00Z", "until": "2026-10-01T02:30:00Z",
+      "totals": {
+        "request_count": 15, "usage_usd": 0.01718,
+        "input_tokens": 106000, "cached_input_tokens": 46000, "output_tokens": 13600
+      },
+      "buckets": [
+        { "from": "2026-10-01T02:00:00Z", "until": "2026-10-01T02:30:00Z", "partial": true,
+          "request_count": 3, "usage_usd": 0.00318, "input_tokens": 18000,
+          "cached_input_tokens": 6000, "output_tokens": 2400 }
+      ]
+    }"#;
+
+    fn approx(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    fn usage_with(balance: &str, week: Option<&str>) -> Usage {
+        Usage {
+            err: None,
+            plan: "pro".into(),
+            balance: Some(serde_json::from_str(balance).unwrap()),
+            week: week.map(|w| serde_json::from_str::<UsageResp>(w).unwrap().totals),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn balance_legacy() {
+        let b: BalanceResp = serde_json::from_str(BALANCE_LEGACY).unwrap();
+        let Included::Legacy { session, weekly } = &b.included else {
+            panic!("expected legacy limits, got {:?}", b.included);
+        };
+        assert!(approx(session.used_frac(), 1.0 - 0.5732));
+        assert!(approx(weekly.used_frac(), 1.0 - 0.9008));
+        assert_eq!(parse_rfc3339(&session.resets_at), Some(1_791_918_000));
+        assert_eq!(parse_rfc3339(&weekly.resets_at), Some(1_792_368_000));
+        // the icon follows the tightest limit
+        assert!(approx(b.included.used_frac(), session.used_frac()));
+        assert_eq!(b.purchased.balance_usd, 0.0);
+        assert_eq!(title_text(&b.included), "S43% · W10%");
+    }
+
+    #[test]
+    fn balance_credits() {
+        let b: BalanceResp = serde_json::from_str(BALANCE_CREDITS).unwrap();
+        let Included::Credits {
+            balance_usd,
+            allowance_usd,
+            period,
+        } = &b.included
+        else {
+            panic!("expected monthly credits, got {:?}", b.included);
+        };
+        assert_eq!((*balance_usd, *allowance_usd), (72.5, 100.0));
+        assert_eq!(parse_rfc3339(&period.until), Some(1_792_056_600));
+        assert!(approx(b.included.used_frac(), 0.275));
+        assert_eq!(b.purchased.balance_usd, 25.0);
+        assert_eq!(title_text(&b.included), "$28/$100");
+    }
+
+    #[test]
+    fn balance_without_purchased() {
+        let b: BalanceResp = serde_json::from_str(
+            r#"{"included": {"balance_usd": 0, "allowance_usd": 0, "period": {"from": "x", "until": "y"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(b.purchased.balance_usd, 0.0);
+        // no allowance: nothing to divide by
+        assert_eq!(b.included.used_frac(), 0.0);
+    }
+
+    #[test]
+    fn balance_unknown_shape_is_an_error() {
+        assert!(serde_json::from_str::<BalanceResp>(r#"{"included": {}, "purchased": {"balance_usd": 0}}"#).is_err());
+    }
+
+    #[test]
+    fn usage_without_usd() {
+        let u: UsageResp = serde_json::from_str(USAGE_LEGACY).unwrap();
+        assert_eq!(u.totals.request_count, 2922);
+        assert_eq!(u.totals.usage_usd, None);
+    }
+
+    #[test]
+    fn usage_with_usd() {
+        let u: UsageResp = serde_json::from_str(USAGE_CREDITS).unwrap();
+        assert_eq!(u.totals.request_count, 15);
+        assert_eq!(u.totals.usage_usd, Some(0.01718));
+    }
+
+    #[test]
+    fn detail_lines_legacy() {
+        let u = usage_with(BALANCE_LEGACY, Some(USAGE_LEGACY));
+        // 2h before the session resets
+        let lines = detail_lines(&u, 1_791_918_000 - 2 * 3600);
+        assert_eq!(lines.len(), 5, "{lines:?}");
+        assert_eq!(lines[0], "Plano: pro");
+        assert!(lines[1].starts_with("Sessão: 42.7% usado · renova em 2h00 ("), "{}", lines[1]);
+        assert!(lines[2].starts_with("Semana: 9.9% usado · renova em 5d 7h ("), "{}", lines[2]);
+        assert_eq!(lines[3], "Créditos comprados: $0.00");
+        assert_eq!(lines[4], "Requests (7 dias): 2922");
+    }
+
+    #[test]
+    fn detail_lines_credits() {
+        let u = usage_with(BALANCE_CREDITS, Some(USAGE_CREDITS));
+        let lines = detail_lines(&u, 1_792_056_600 - 3600);
+        assert_eq!(lines.len(), 5, "{lines:?}");
+        assert_eq!(
+            lines[1],
+            "Créditos do plano: $27.50 de $100.00 usados (27.5%) · $72.50 disponível"
+        );
+        assert!(lines[2].starts_with("Período: "), "{}", lines[2]);
+        assert!(lines[2].contains(" · renova em 1h00 ("), "{}", lines[2]);
+        assert_eq!(lines[3], "Créditos comprados: $25.00");
+        assert_eq!(lines[4], "Requests (7 dias): 15 · $0.02");
+    }
+
+    #[test]
+    fn detail_lines_without_optional_endpoints() {
+        // api/me and api/usage failed: the balance still shows
+        let mut u = usage_with(BALANCE_LEGACY, None);
+        u.plan = "?".into();
+        u.note(ApiError {
+            msg: "api/usage: HTTP 503: unavailable".into(),
+            retry_after: None,
+        });
+        let lines = detail_lines(&u, 0);
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert!(format_tooltip(&u, 0).ends_with("\nAviso: api/usage: HTTP 503: unavailable"));
+    }
+
+    #[test]
+    fn note_keeps_the_longest_retry_after() {
+        let mut u = Usage::default();
+        for retry_after in [Some(30), None, Some(12)] {
+            u.note(ApiError {
+                msg: "x".into(),
+                retry_after,
+            });
+        }
+        assert_eq!(u.retry_after, Some(30));
+        assert_eq!(u.warnings.len(), 3);
+    }
+
+    #[test]
+    fn icon_variants() {
+        assert_eq!(icon_variant(0.0), "ollama-usage-tray");
+        assert_eq!(icon_variant(0.69), "ollama-usage-tray");
+        assert_eq!(icon_variant(0.7), "ollama-usage-tray-warn");
+        assert_eq!(icon_variant(0.9), "ollama-usage-tray-crit");
+        assert_eq!(icon_variant(1.0), "ollama-usage-tray-crit");
+    }
+
+    #[test]
+    fn rfc3339() {
+        assert_eq!(parse_rfc3339("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(parse_rfc3339("2024-02-29T12:34:56Z"), Some(1_709_210_096));
+        assert_eq!(parse_rfc3339("2024-02-29T12:34:56.789Z"), Some(1_709_210_096));
+        assert_eq!(parse_rfc3339("2024-02-29T09:34:56-03:00"), Some(1_709_210_096));
+        assert_eq!(parse_rfc3339("2024-02-29T13:34:56+01:00"), Some(1_709_210_096));
+        assert_eq!(parse_rfc3339("2024-02-29"), None);
+        assert_eq!(parse_rfc3339("2024-13-01T00:00:00Z"), None);
+        assert_eq!(parse_rfc3339("2024-02-29T12:34:56"), None);
+        assert_eq!(parse_rfc3339("2024-02-29T12:34:56+0300"), None);
+        assert_eq!(parse_rfc3339("+024-02-29T12:34:56Z"), None);
+    }
+
+    #[test]
+    fn civil_round_trip() {
+        for secs in [0, 951_782_400, 1_709_210_096, 1_792_368_000] {
+            let (y, m, d) = epoch_to_ymd(secs);
+            assert_eq!(
+                days_from_civil(y, m as i64, d as i64),
+                secs.div_euclid(86_400)
+            );
+        }
+    }
+
+    #[test]
+    fn until_labels() {
+        assert_eq!(until_label(1), "1 min");
+        assert_eq!(until_label(59 * 60), "59 min");
+        assert_eq!(until_label(60 * 60), "1h00");
+        assert_eq!(until_label(81 * 60), "1h21");
+        assert_eq!(until_label(5 * 86_400 + 6 * 3600), "5d 6h");
+    }
+
+    #[test]
+    fn reset_labels() {
+        assert!(reset_label("2026-10-13T19:00:00Z", 1_791_918_000).starts_with("renovou ("));
+        assert!(reset_label("2026-10-13T19:00:00Z", 1_791_918_000 - 60).starts_with("renova em 1 min ("));
+        assert_eq!(reset_label("amanhã", 0), "renova em amanhã");
+    }
+
+    #[test]
+    fn error_messages() {
+        assert_eq!(
+            error_field(r#"{"error": "unsupported or repeated parameter: foo"}"#).as_deref(),
+            Some("unsupported or repeated parameter: foo")
+        );
+        assert_eq!(error_field("<html>bad gateway</html>"), None);
+        assert_eq!(error_field(r#"{"message": "x"}"#), None);
     }
 }

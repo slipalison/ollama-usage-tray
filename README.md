@@ -1,14 +1,14 @@
 # ollama-usage-tray
 
-Um indicador de bandeja (system tray) leve para Linux/GNOME que monitora o consumo do seu plano **Ollama Cloud** na barra superior — créditos usados, sessão, requests e dias até a renovação. Tudo em Rust puro, sem GTK, ~11 MB de RAM.
+Um indicador de bandeja (system tray) leve para Linux/GNOME que monitora o consumo do seu plano **Ollama Cloud** na barra superior — limites de sessão e semana ou créditos do mês, requests e quando o plano renova. Tudo em Rust puro, sem GTK, ~11 MB de RAM.
 
 ![ícone](assets/icon.svg)
 
 ## Recursos
 
-- **Título na bandeja**: `$34/$300` — dólares usados vs. créditos do plano
-- **Ícone customizado** com anel de status (azul → laranja ≥70% → vermelho ≥90%)
-- **Menu completo**: plano, créditos, uso (7 dias ou mês), sessão atual, requests por modelo, renovação
+- **Título na bandeja**: `S43% · W10%` (plano legado: quanto da sessão e da semana já foi usado) ou `$28/$100` (créditos mensais: dólares usados vs. créditos do plano)
+- **Ícone customizado** com anel de status (azul → laranja ≥70% → vermelho ≥90%), pelo limite mais apertado
+- **Menu completo**: plano, sessão e semana ou créditos do mês, horário de renovação (vindo da API, no fuso local), créditos comprados, requests dos últimos 7 dias
 - **Detecção automática do modelo de preço**: contas antigas (limites de sessão/semana) e o novo modelo de créditos mensais em dólares são ambos suportados sem configuração
 - **Gestão de API key**: `set-key`, `show-key`, `clear-key`, `key-info`; cópia da key (mascarada) direto do menu
 - **Single-instance** (lock via `fd-lock`) e **autostart** no login
@@ -47,7 +47,7 @@ O app fica na bandeja. Clique com o botão direito para o menu; passe o mouse pa
 
 ```bash
 ollama-usage-tray                 # inicia o tray (segunda instância sai sozinha)
-ollama-usage-tray key-info        # valida a key e imprime plano/uso no terminal
+ollama-usage-tray key-info        # valida a key e imprime plano, uso e renovação no terminal
 ollama-usage-tray set-key <KEY>   # salva a API key (ou via stdin: echo <KEY> | ollama-usage-tray set-key)
 ollama-usage-tray show-key        # mostra a key mascarada + origem
 ollama-usage-tray clear-key       # remove a key salva localmente
@@ -63,10 +63,13 @@ ollama-usage-tray clear-key       # remove a key salva localmente
 
 | Endpoint | Uso |
 |---|---|
-| `GET https://ollama.com/api/usage` | `limits.session.usage`, `limits.weekly.usage` (frações), `activity.cost` (novo modelo mensal) |
-| `POST https://ollama.com/api/me` | Plano (`pro`/`max`/`team`/`starter`) e data de criação (dia de renovação mensal) |
+| `GET https://ollama.com/api/balance` | Plano legado: `included.session` e `included.weekly` (`remaining_percent`, `resets_at`). Créditos mensais: `included.balance_usd`, `allowance_usd` e `period`. Os dois: `purchased.balance_usd` |
+| `GET https://ollama.com/api/usage?range=7d` | `totals.request_count` e, nos planos novos, `totals.usage_usd` |
+| `POST https://ollama.com/api/me` | Nome do plano |
 
-Créditos por plano: `pro` = $60/mês, `max` = $300/mês, `team` = $1000/mês (fonte: ollama.com/pricing).
+Documentação: [Balance](https://docs.ollama.com/api/balance) e [Cloud usage](https://docs.ollama.com/api/cloud-usage).
+
+O `/api/balance` é o dado essencial: se `/api/me` ou `/api/usage` falharem, o tray continua mostrando os limites, com um aviso no tooltip. Os endpoints aceitam 10 requisições por minuto por usuário, somando todas as keys e dispositivos; o tray consulta a cada 5 minutos e, num `429`, espera o `Retry-After` antes de tentar de novo (inclusive no "Atualizar agora").
 
 ## Segurança
 
